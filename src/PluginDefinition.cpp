@@ -1,22 +1,15 @@
-//this file is part of notepad++
-//Copyright (C)2022 Don HO <don.h@free.fr>
-//
-//This program is free software; you can redistribute it and/or
-//modify it under the terms of the GNU General Public License
-//as published by the Free Software Foundation; either
-//version 2 of the License, or (at your option) any later version.
-//
-//This program is distributed in the hope that it will be useful,
-//but WITHOUT ANY WARRANTY; without even the implied warranty of
-//MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-//GNU General Public License for more details.
-//
-//You should have received a copy of the GNU General Public License
-//along with this program; if not, write to the Free Software
-//Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+// plugin definition file for Notepad++ 
 
+#include <regex>
+#include <vector>
+#include <sstream>
+#include <string>
+#include <future>
+#include <thread>
 #include "PluginDefinition.h"
 #include "menuCmdID.h"
+
+using namespace std;
 
 //
 // The plugin data that Notepad++ needs
@@ -27,6 +20,95 @@ FuncItem funcItem[nbFunc];
 // The data of Notepad++ that you can use in your plugin commands
 //
 NppData nppData;
+
+
+// custom strcucts and functions
+
+struct RegexMatch
+{
+    regex pattern;
+    string replacement;
+
+	RegexMatch(const regex& pat, const string& repl) : pattern(pat), replacement(repl) {}
+
+};
+
+
+vector<string> getFirstLines(const string& text, size_t count = 10) {
+    istringstream stream(text);
+    vector<string> lines;
+    string line;
+
+    while (lines.size() < count && getline(stream, line)) {
+        lines.push_back(line);
+    }
+
+    return lines;
+};
+
+const RegexMatch* selectBestPattern(const vector<RegexMatch>& patterns, const string& text) {
+
+    const RegexMatch* bestPattern = nullptr;
+    vector<string> firstLines = getFirstLines(text, 10);
+
+    for (const auto& line : firstLines) {
+        for (const auto& pattern : patterns) {
+            string transformed = regex_replace(line, pattern.pattern, pattern.replacement);
+            if (transformed != line) {
+                // Found a match — use this pattern
+                bestPattern = &pattern;
+                break;
+            }
+        }
+        if (bestPattern) break;
+    }
+
+    return bestPattern;
+
+};
+
+// split text into blocks of a specified number of lines
+vector<string> splitIntoBlocks(const string& text, size_t linesPerBlock) {
+    istringstream stream(text);
+    vector<string> blocks;
+    ostringstream currentBlock;
+    string line;
+    size_t lineCount = 0;
+
+    while (getline(stream, line)) {
+        currentBlock << line << '\n';
+        if (++lineCount >= linesPerBlock) {
+            blocks.push_back(currentBlock.str());
+            currentBlock.str("");
+            currentBlock.clear();
+            lineCount = 0;
+        }
+    }
+
+    if (lineCount > 0) {
+        blocks.push_back(currentBlock.str());
+    }
+
+    return blocks;
+};
+
+
+// Process a block of text using the best regex pattern
+
+string processBlock(const string& block, const RegexMatch* bestPattern) {
+    istringstream in(block);
+    ostringstream out;
+    string line;
+
+    while (getline(in, line)) {
+        line = regex_replace(line, bestPattern ->pattern , bestPattern ->replacement);
+        out << line << '\n';
+    }
+
+    return out.str();
+};
+
+
 
 //
 // Initialize your plugin data here
@@ -47,19 +129,13 @@ void pluginCleanUp()
 // You should fill your plugins commands here
 void commandMenuInit()
 {
-
-    //--------------------------------------------//
-    //-- STEP 3. CUSTOMIZE YOUR PLUGIN COMMANDS --//
-    //--------------------------------------------//
-    // with function :
     // setCommand(int index,                      // zero based number to indicate the order of command
     //            TCHAR *commandName,             // the command name that you want to see in plugin menu
     //            PFUNCPLUGINCMD functionPointer, // the symbol of function (function pointer) associated with this command. The body should be defined below. See Step 4.
     //            ShortcutKey *shortcut,          // optional. Define a shortcut to trigger this command
     //            bool check0nInit                // optional. Make this menu item be checked visually
     //            );
-    setCommand(0, TEXT("Hello Notepad++"), hello, NULL, false);
-    setCommand(1, TEXT("Hello (with dialog)"), helloDlg, NULL, false);
+    setCommand(0, TEXT("CleanTraceLog"), CleanTraceLog, NULL, false);
 }
 
 //
@@ -90,27 +166,76 @@ bool setCommand(size_t index, TCHAR *cmdName, PFUNCPLUGINCMD pFunc, ShortcutKey 
     return true;
 }
 
-//----------------------------------------------//
-//-- STEP 4. DEFINE YOUR ASSOCIATED FUNCTIONS --//
-//----------------------------------------------//
-void hello()
+// plugin main function
+void CleanTraceLog()
 {
-    // Open a new document
-    ::SendMessage(nppData._nppHandle, NPPM_MENUCOMMAND, 0, IDM_FILE_NEW);
+    // display a message in the status bar
+    ::SendMessage(nppData._nppHandle, NPPM_SETSTATUSBAR, 0, (LPARAM)TEXT("Analising trace log file..."));
+	Sleep(2000); // simulate some processing time
 
-    // Get the current scintilla
+	// Target the current Scintilla editor
     int which = -1;
     ::SendMessage(nppData._nppHandle, NPPM_GETCURRENTSCINTILLA, 0, (LPARAM)&which);
-    if (which == -1)
+    if (which == -1) return;
+
+	// Get the current Scintilla handle
+    HWND curScintilla = (which == 0) ? nppData._scintillaMainHandle : nppData._scintillaSecondHandle;
+
+	// Get the text length of the current Scintilla editor
+    int length = (int)::SendMessage(curScintilla, SCI_GETTEXTLENGTH, 0, 0);
+    char* text = new char[length + 1];
+    ::SendMessage(curScintilla, SCI_GETTEXT, length + 1, (LPARAM)text);
+
+	// Convert the text to a string for easier manipulation
+    string content(text);
+    delete[] text;
+
+	// Regex to remove timestamps, we can potentially have multiple patterns
+    vector<RegexMatch> regexPatterns = {
+        {
+            regex(R"(PSAPPSRV\.\d+ \[(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2}\.\d+)\] [^ ]+ \d+ \w+ \(\d+\)\s+\d+-\d+\s+\d+\.\d+\s+(Cur#\d+\.\d+\.\w+ RC=\d+ Dur=\d+\.\d+)?)"),
+            "[$1 $2]"
+        },
+        {
+            regex(R"(PSAPPSRV\.\d+ \(\d+\)\s+\d+-\d+\s+(\d{2}\.\d{2}\.\d{2})\s+(\d*\.\d*\s+)?[^ ]+\s+RC=\d+\s+Dur=\d+\.\d+\s+(.*))"),
+            "$1 $3"
+        }
+    };
+
+
+	// Select the best regex pattern based on the first few lines of the content
+	const RegexMatch* bestPattern = selectBestPattern(regexPatterns, content);
+
+    if (!bestPattern) {
+        ::MessageBox(NULL, TEXT("No matching pattern found."), TEXT("Error"), MB_OK | MB_ICONERROR);
         return;
-    HWND curScintilla = (which == 0)?nppData._scintillaMainHandle:nppData._scintillaSecondHandle;
+    }
+    else
+    {
+		// execute the regex replacement
 
-    // Say hello now :
-    // Scintilla control has no Unicode mode, so we use (char *) here
-    ::SendMessage(curScintilla, SCI_SETTEXT, 0, (LPARAM)"Hello, Notepad++!");
-}
+        ::SendMessage(nppData._nppHandle, NPPM_SETSTATUSBAR, 0, (LPARAM)TEXT("Adding timestamps..."));
+        Sleep(2000); // simulate some processing time
 
-void helloDlg()
-{
-    ::MessageBox(NULL, TEXT("Hello, Notepad++!"), TEXT("Notepad++ Plugin Template"), MB_OK);
+        auto blocks = splitIntoBlocks(content, 10000); // 10,000 lines per block
+
+        vector<future<string>> futures;
+        for (const auto& block : blocks) {
+            futures.push_back(async(launch::async, processBlock, block, bestPattern));
+        }
+        
+        ::SendMessage(nppData._nppHandle, NPPM_SETSTATUSBAR, 0, (LPARAM)TEXT("Applying changes..."));
+        ostringstream finalResult;
+        for (auto& f : futures) {
+            finalResult << f.get();
+        };
+     
+        string cleaned = finalResult.str();
+        ::SendMessage(curScintilla, SCI_SETTEXT, 0, (LPARAM)cleaned.c_str());
+
+    };
+
+    ::SendMessage(nppData._nppHandle, NPPM_SETSTATUSBAR, 0, (LPARAM)TEXT("Cleaning complete."));
+
+
 }
